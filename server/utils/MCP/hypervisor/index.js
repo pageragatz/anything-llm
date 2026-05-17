@@ -458,9 +458,28 @@ class MCPHypervisor {
     const transport = await this.#setupServerTransport(server, serverType);
 
     // Add connection event listeners
-    transport.onclose = () => this.log(`${name} - Transport closed`);
-    transport.onerror = (error) =>
+    transport.onclose = () => {
+      this.log(`${name} - Transport closed`);
+      // Remove from active servers so the next bootMCPServers() call rebuilds
+      // the connection with a proper initialization handshake instead of reusing
+      // a stale, uninitialized session reference.
+      if (this.mcps[name]) {
+        delete this.mcps[name];
+        this.mcpLoadingResults[name] = {
+          status: "failed",
+          message: `MCP server "${name}" transport closed unexpectedly.`,
+        };
+      }
+    };
+    transport.onerror = (error) => {
       this.log(`${name} - Transport error:`, error);
+      // SSE EventSource auto-reconnects after a dropped connection, silently
+      // updating the session endpoint URL while the Client still thinks it is
+      // connected to the old session. Explicitly closing the transport stops
+      // the auto-reconnect loop and fires onclose, which clears the stale
+      // entry from this.mcps so the next boot call re-initializes properly.
+      transport.close().catch(() => {});
+    };
     transport.onmessage = (message) =>
       this.log(`${name} - Transport message:`, message);
 
