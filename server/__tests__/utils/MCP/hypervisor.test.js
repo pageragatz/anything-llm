@@ -1,243 +1,220 @@
 /**
- * Tests for MCPHypervisor transport event handling.
+ * Integration tests for MCPHypervisor SSE transport handling.
  *
- * The SSE transport bug: EventSource auto-reconnects when the server drops the
- * connection, silently updating transport._endpoint to a new session URL while
- * the MCP Client still considers itself connected to the old session. Subsequent
- * tool calls hit the new, uninitialized session on the server and get
- * "RuntimeError: Received request before initialization was complete".
+ * The bug being verified:
+ *   SSEClientTransport uses an EventSource which auto-reconnects when the
+ *   server drops the SSE stream. On reconnect, the new `endpoint` event
+ *   silently updates transport._endpoint to a new session URL. The MCP
+ *   Client still thinks it is connected, so subsequent tool calls hit a
+ *   fresh, uninitialized session on the server and get rejected with
+ *   "Received request before initialization was complete".
  *
- * The fix: transport.onerror calls transport.close() to stop auto-reconnect and
- * fire transport.onclose. transport.onclose removes the stale mcp from this.mcps
- * so the next bootMCPServers() call rebuilds with a proper handshake.
+ * These tests run a real http.Server with the SDK's SSEServerTransport, then
+ * connect to it through the real MCPHypervisor (which uses the SDK's Client
+ * and SSEClientTransport). They exercise the actual handler-chaining inside
+ * Client.connect / Protocol.connect, so a regression in any of those layers
+ * would be caught. The tests also include a regression check that fails if
+ * the onerror→close→cleanup fix is removed.
  */
+
+const http = require("node:http");
+const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
+const {
+  SSEServerTransport,
+} = require("@modelcontextprotocol/sdk/server/sse.js");
+const {
+  ListToolsRequestSchema,
+} = require("@modelcontextprotocol/sdk/types.js");
 
 const MCPHypervisor = require("../../../utils/MCP/hypervisor");
 
-function makeMockTransport() {
-  return {
-    onclose: null,
-    onerror: null,
-    onmessage: null,
-    start: jest.fn().mockResolvedValue(undefined),
-    send: jest.fn().mockResolvedValue(undefined),
-    close: jest.fn().mockImplementation(async function () {
-      this.onclose?.();
-    }),
-  };
+// ----- Test SSE server fixture -----
+
+class TestMcpServer {
+  constructor() {
+    this.activeTransports = new Map(); // sessionId -> SSEServerTransport
+    this.sessionsInitialized = new Set();
+    this.listToolsCallCount = 0;
+  }
+
+  async start() {
+    this.httpServer = http.createServer(async (req, res) => {
+      const url = new URL(req.url, "http://localhost");
+      if (req.method === "GET" && url.pathname === "/sse") {
+        const sdkServer = new Server(
+          { name: "test-mcp", version: "0.1.0" },
+          { capabilities: { tools: {} } }
+        );
+        sdkServer.setRequestHandler(ListToolsRequestSchema, async () => {
+          this.listToolsCallCount++;
+          return { tools: [{ name: "noop", description: "noop", inputSchema: { type: "object" } }] };
+        });
+
+        const transport = new SSEServerTransport("/messages", res);
+        // Track the session as soon as it sends its endpoint event.
+        const originalStart = transport.start.bind(transport);
+        transport.start = async () => {
+          await originalStart();
+          this.activeTransports.set(transport.sessionId, transport);
+        };
+        await sdkServer.connect(transport);
+        // sdkServer.connect calls transport.start() which writes the endpoint event.
+      } else if (req.method === "POST" && url.pathname === "/messages") {
+        const sessionId = url.searchParams.get("sessionId");
+        const transport = this.activeTransports.get(sessionId);
+        if (!transport) {
+          res.writeHead(404).end("Unknown session");
+          return;
+        }
+        await transport.handlePostMessage(req, res);
+      } else {
+        res.writeHead(404).end();
+      }
+    });
+
+    await new Promise((resolve) => this.httpServer.listen(0, resolve));
+    const { port } = this.httpServer.address();
+    this.url = `http://127.0.0.1:${port}/sse`;
+  }
+
+  // Forcibly drop every active SSE stream — simulates the server crashing,
+  // restarting, or timing the client out. The client's EventSource will react
+  // by firing onerror (and, without the fix, silently auto-reconnecting).
+  killAllSseConnections() {
+    for (const [sessionId, transport] of this.activeTransports) {
+      try {
+        transport.res?.destroy();
+      } catch {
+        /* ignore */
+      }
+      this.activeTransports.delete(sessionId);
+      this.sessionsInitialized.delete(sessionId);
+    }
+  }
+
+  async stop() {
+    this.killAllSseConnections();
+    await new Promise((resolve) => this.httpServer.close(resolve));
+  }
 }
 
-function makeMockMcp(transport) {
-  return {
-    transport,
-    connect: jest.fn().mockImplementation(async () => {
-      // Simulate Protocol.connect() wrapping the handlers then calling start()
-      const _onclose = transport.onclose;
-      const _onerror = transport.onerror;
-      transport.onclose = () => {
-        _onclose?.();
-      };
-      transport.onerror = (err) => {
-        _onerror?.(err);
-      };
-      await transport.start();
-    }),
-    close: jest.fn().mockResolvedValue(undefined),
-  };
+// Poll a predicate up to `timeoutMs`; resolves when true, rejects on timeout.
+async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 25 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error(`waitFor timed out after ${timeoutMs}ms`);
 }
 
-describe("MCPHypervisor transport event handlers", () => {
+// ----- Tests -----
+
+describe("MCPHypervisor SSE transport handling (real server)", () => {
+  let testServer;
   let hypervisor;
 
-  beforeEach(() => {
-    // Reset singleton between tests
+  beforeEach(async () => {
+    testServer = new TestMcpServer();
+    await testServer.start();
+
     MCPHypervisor._instance = null;
     hypervisor = new MCPHypervisor();
-
-    // Suppress log output in tests
     jest.spyOn(hypervisor, "log").mockImplementation(() => {});
+
+    // Point the hypervisor at our test server via the config getter.
+    jest
+      .spyOn(hypervisor, "mcpServerConfigs", "get")
+      .mockReturnValue([
+        {
+          name: "test-server",
+          server: { type: "sse", url: testServer.url },
+        },
+      ]);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Best-effort cleanup of any still-connected mcps the hypervisor is holding.
+    for (const name of Object.keys(hypervisor.mcps)) {
+      try {
+        await hypervisor.mcps[name].close();
+      } catch {
+        /* ignore */
+      }
+    }
     MCPHypervisor._instance = null;
+    await testServer.stop();
     jest.restoreAllMocks();
   });
 
-  describe("transport.onclose removes the server from this.mcps", () => {
-    it("removes a connected server when its transport closes", async () => {
-      const transport = makeMockTransport();
-      const mcp = makeMockMcp(transport);
+  it("happy path: boots the server and listTools works through real SSE", async () => {
+    await hypervisor.bootMCPServers();
 
-      // Manually register as if #startMCPServer ran successfully
-      hypervisor.mcps["test-server"] = mcp;
-      hypervisor.mcpLoadingResults["test-server"] = {
-        status: "success",
-        message: "Connected",
-      };
+    expect(hypervisor.mcps["test-server"]).toBeDefined();
+    expect(hypervisor.mcpLoadingResults["test-server"].status).toBe("success");
 
-      // Attach the onclose handler the same way #startMCPServer does
-      transport.onclose = () => {
-        if (hypervisor.mcps["test-server"]) {
-          delete hypervisor.mcps["test-server"];
-          hypervisor.mcpLoadingResults["test-server"] = {
-            status: "failed",
-            message: 'MCP server "test-server" transport closed unexpectedly.',
-          };
-        }
-      };
-
-      expect(hypervisor.mcps["test-server"]).toBeDefined();
-
-      // Simulate transport closing
-      transport.onclose();
-
-      expect(hypervisor.mcps["test-server"]).toBeUndefined();
-      expect(hypervisor.mcpLoadingResults["test-server"].status).toBe("failed");
-    });
-
-    it("is idempotent — double close does not throw", () => {
-      const transport = makeMockTransport();
-
-      hypervisor.mcps["test-server"] = { transport };
-      hypervisor.mcpLoadingResults["test-server"] = {
-        status: "success",
-        message: "Connected",
-      };
-
-      transport.onclose = () => {
-        if (hypervisor.mcps["test-server"]) {
-          delete hypervisor.mcps["test-server"];
-          hypervisor.mcpLoadingResults["test-server"] = {
-            status: "failed",
-            message: 'MCP server "test-server" transport closed unexpectedly.',
-          };
-        }
-      };
-
-      expect(() => {
-        transport.onclose();
-        transport.onclose(); // Second call should be a no-op
-      }).not.toThrow();
-
-      expect(hypervisor.mcps["test-server"]).toBeUndefined();
-    });
+    const result = await hypervisor.mcps["test-server"].listTools();
+    expect(result.tools).toHaveLength(1);
+    expect(result.tools[0].name).toBe("noop");
+    expect(testServer.listToolsCallCount).toBe(1);
   });
 
-  describe("transport.onerror stops SSE auto-reconnect by closing the transport", () => {
-    it("calls transport.close() when an error occurs", async () => {
-      const transport = makeMockTransport();
-      const mcp = makeMockMcp(transport);
+  it("clears this.mcps[name] when the server drops the SSE connection", async () => {
+    await hypervisor.bootMCPServers();
+    expect(hypervisor.mcps["test-server"]).toBeDefined();
 
-      hypervisor.mcps["test-server"] = mcp;
-      hypervisor.mcpLoadingResults["test-server"] = {
-        status: "success",
-        message: "Connected",
-      };
+    // Server-side disconnect — the client EventSource will fire onerror.
+    testServer.killAllSseConnections();
 
-      // Attach the onerror handler the same way #startMCPServer does
-      transport.onclose = () => {
-        if (hypervisor.mcps["test-server"]) {
-          delete hypervisor.mcps["test-server"];
-          hypervisor.mcpLoadingResults["test-server"] = {
-            status: "failed",
-            message: 'MCP server "test-server" transport closed unexpectedly.',
-          };
-        }
-      };
-      transport.onerror = (error) => {
-        hypervisor.log(`test-server - Transport error:`, error);
-        transport.close().catch(() => {});
-      };
+    // The fix wires onerror → transport.close() → onclose → delete mcps[name].
+    // Without that chain, mcps["test-server"] would stay populated because
+    // EventSource would silently auto-reconnect without re-initialization.
+    await waitFor(() => hypervisor.mcps["test-server"] === undefined);
 
-      const error = new Error("SSE connection dropped");
-      transport.onerror(error);
-
-      // Allow the microtask queue to flush (transport.close() is async)
-      await Promise.resolve();
-
-      expect(transport.close).toHaveBeenCalled();
-    });
-
-    it("removes server from mcps after error triggers close", async () => {
-      const transport = makeMockTransport();
-      const mcp = makeMockMcp(transport);
-
-      hypervisor.mcps["test-server"] = mcp;
-      hypervisor.mcpLoadingResults["test-server"] = {
-        status: "success",
-        message: "Connected",
-      };
-
-      transport.onclose = () => {
-        if (hypervisor.mcps["test-server"]) {
-          delete hypervisor.mcps["test-server"];
-          hypervisor.mcpLoadingResults["test-server"] = {
-            status: "failed",
-            message: 'MCP server "test-server" transport closed unexpectedly.',
-          };
-        }
-      };
-      transport.onerror = (error) => {
-        hypervisor.log(`test-server - Transport error:`, error);
-        transport.close().catch(() => {});
-      };
-
-      expect(hypervisor.mcps["test-server"]).toBeDefined();
-
-      transport.onerror(new Error("SSE dropped"));
-      await Promise.resolve(); // flush microtasks
-
-      expect(hypervisor.mcps["test-server"]).toBeUndefined();
-      expect(hypervisor.mcpLoadingResults["test-server"].status).toBe("failed");
-    });
+    expect(hypervisor.mcps["test-server"]).toBeUndefined();
+    expect(hypervisor.mcpLoadingResults["test-server"].status).toBe("failed");
   });
 
-  describe("bootMCPServers re-initializes after a dropped connection", () => {
-    it("re-boots a server that was removed from mcps due to transport close", async () => {
-      // Simulate a server that was running and then dropped
-      hypervisor.mcps = {}; // starts empty after cleanup
-      hypervisor.mcpLoadingResults = {};
+  it("does not leave a stale, never-initialized session reachable via mcps", async () => {
+    // This is the regression check that maps directly to the original bug:
+    // after a server-side drop, the next attempt to use the cached mcp must
+    // NOT silently succeed against a fresh, uninitialized session.
+    await hypervisor.bootMCPServers();
+    const staleMcp = hypervisor.mcps["test-server"];
+    expect(staleMcp).toBeDefined();
 
-      const serverConfig = {
-        "dropped-server": {
-          command: "node",
-          args: ["server.js"],
-        },
-      };
+    testServer.killAllSseConnections();
+    await waitFor(() => hypervisor.mcps["test-server"] === undefined);
 
-      // Mock the config file reading to return our test server
-      jest
-        .spyOn(hypervisor, "mcpServerConfigs", "get")
-        .mockReturnValue([
-          { name: "dropped-server", server: serverConfig["dropped-server"] },
-        ]);
+    // The hypervisor's lookup map no longer exposes the stale client. This is
+    // what the call sites (convertServerToolsToPlugins, _resolveMcpVariable)
+    // check before invoking tools, so an agent call right now would correctly
+    // return null instead of POSTing tools/list to a fresh, uninitialized
+    // session on the server.
+    expect(hypervisor.mcps["test-server"]).toBeUndefined();
 
-      // Mock #startMCPServer (private) via the public startMCPServer
-      jest
-        .spyOn(hypervisor, "startMCPServer")
-        .mockResolvedValue({ success: true });
+    // Calling listTools directly on the stale reference should also fail —
+    // Protocol._onclose runs as part of our cleanup chain and sets the
+    // client's _transport to undefined, so the request gets rejected.
+    await expect(staleMcp.listTools()).rejects.toThrow();
+  });
 
-      // Spy on the private #startMCPServer via its public wrapper
-      // We verify bootMCPServers doesn't skip when mcps is empty
-      const bootSpy = jest
-        .spyOn(hypervisor, "bootMCPServers")
-        .mockImplementationOnce(async () => {
-          // Simulate actual boot: registers the server
-          hypervisor.mcps["dropped-server"] = { connected: true };
-          hypervisor.mcpLoadingResults["dropped-server"] = {
-            status: "success",
-            message: "Reconnected",
-          };
-          return hypervisor.mcpLoadingResults;
-        });
+  it("re-initializes successfully after a dropped connection", async () => {
+    await hypervisor.bootMCPServers();
+    expect(hypervisor.mcps["test-server"]).toBeDefined();
 
-      await hypervisor.bootMCPServers();
+    testServer.killAllSseConnections();
+    await waitFor(() => hypervisor.mcps["test-server"] === undefined);
 
-      expect(bootSpy).toHaveBeenCalledTimes(1);
-      expect(hypervisor.mcps["dropped-server"]).toBeDefined();
-      expect(hypervisor.mcpLoadingResults["dropped-server"].status).toBe(
-        "success"
-      );
-    });
+    // Next boot call must rebuild — the empty mcps map allows it through the
+    // early-return guard, and the full initialize handshake must complete.
+    await hypervisor.bootMCPServers();
+    expect(hypervisor.mcps["test-server"]).toBeDefined();
+    expect(hypervisor.mcpLoadingResults["test-server"].status).toBe("success");
+
+    // And the rebuilt connection actually works end-to-end against the server.
+    const result = await hypervisor.mcps["test-server"].listTools();
+    expect(result.tools).toHaveLength(1);
+    expect(testServer.listToolsCallCount).toBe(1);
   });
 });
