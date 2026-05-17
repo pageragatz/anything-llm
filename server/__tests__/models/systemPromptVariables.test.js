@@ -4,6 +4,7 @@ const prisma = require("../../utils/prisma");
 // Mock the MCP compatibility layer so tests don't need a running MCP server.
 jest.mock("../../utils/MCP", () => {
   return jest.fn().mockImplementation(() => ({
+    bootMCPServers: jest.fn().mockResolvedValue({}),
     mcps: {
       "test-server": {
         callTool: jest.fn().mockResolvedValue({
@@ -20,6 +21,11 @@ jest.mock("../../utils/MCP", () => {
       },
       "error-server": {
         callTool: jest.fn().mockRejectedValue(new Error("Tool call failed")),
+      },
+      "combo-server": {
+        callTool: jest.fn().mockResolvedValue({
+          content: [{ type: "text", text: "combo-text" }],
+        }),
       },
     },
   }));
@@ -145,10 +151,10 @@ describe("SystemPromptVariables.expandSystemPromptVariables - MCP variables", ()
   it("should expand mcp variables alongside static and workspace variables", async () => {
     prisma.workspaces.findUnique.mockResolvedValue({ name: "My Workspace" });
     const result = await SystemPromptVariables.expandSystemPromptVariables(
-      "Workspace: {workspace.name}. Now playing: {mcp.test-server.get_now_playing}",
+      "Workspace: {workspace.name}. Status: {mcp.combo-server.combo_tool}",
       null,
       1
     );
-    expect(result).toBe("Workspace: My Workspace. Now playing: Artist — Track Title");
+    expect(result).toBe("Workspace: My Workspace. Status: combo-text");
   });
 });

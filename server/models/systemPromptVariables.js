@@ -2,8 +2,10 @@ const prisma = require("../utils/prisma");
 const moment = require("moment");
 
 // TTL cache for MCP variable results to avoid hammering MCP servers on every message.
+// Failures are cached at a shorter TTL so a broken variable doesn't spam logs every turn.
 const _mcpVariableCache = new Map();
 const MCP_VARIABLE_TTL_MS = 30_000;
+const MCP_VARIABLE_FAILURE_TTL_MS = 10_000;
 const MCP_VARIABLE_TIMEOUT_MS = 3_000;
 
 /**
@@ -29,11 +31,19 @@ async function _resolveMcpVariable(key) {
     // Lazy require avoids circular dependency issues at module load time.
     const MCPCompatibilityLayer = require("../utils/MCP");
     const mcpLayer = new MCPCompatibilityLayer();
+    // Boot is idempotent — early-returns when servers are already running — but is
+    // required for the cold-start case where the user has an mcp variable but has
+    // never invoked an agent or opened the MCP admin page.
+    await mcpLayer.bootMCPServers();
     const mcp = mcpLayer.mcps[serverName];
     if (!mcp) {
       console.warn(
         `[MCP Variable] Server "${serverName}" not found or not running`
       );
+      _mcpVariableCache.set(key, {
+        value: "",
+        expiresAt: Date.now() + MCP_VARIABLE_FAILURE_TTL_MS,
+      });
       return "";
     }
 
@@ -48,10 +58,17 @@ async function _resolveMcpVariable(key) {
     ]);
 
     const value = _extractMcpText(result);
-    _mcpVariableCache.set(key, { value, expiresAt: Date.now() + MCP_VARIABLE_TTL_MS });
+    _mcpVariableCache.set(key, {
+      value,
+      expiresAt: Date.now() + MCP_VARIABLE_TTL_MS,
+    });
     return value;
   } catch (error) {
     console.warn(`[MCP Variable] Failed to resolve {${key}}:`, error.message);
+    _mcpVariableCache.set(key, {
+      value: "",
+      expiresAt: Date.now() + MCP_VARIABLE_FAILURE_TTL_MS,
+    });
     return "";
   }
 }
